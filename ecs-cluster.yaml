@@ -1,0 +1,475 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  VPCID:
+    Type: String
+  SubnetId1:
+    Type: String
+  SubnetId2:
+    Type: String
+  InstanceType:
+    Type: String
+    Default: t2.micro
+  ECSAMI:
+    Description: AMI ID
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: "/aws/service/ecs/optimized-ami/amazon-linux/recommended/image_id"
+  KeyName:
+    Type: String
+  AllowedCIDRIp:
+    Type: String
+    Default: 0.0.0.0/0
+Resources:
+# We always launch the worker node of cluster through launch configuration
+# On the top of that we apply Autoscaling
+# Now we can enable that autoscaling through scaling policies or
+# ECS capacity provider but capacity provider is not supportes through cfn rught now but through console
+# I have tested it and for to enable the cluster scaling i have implemented a scaling policies of autoscaling directly.'''
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: ECS_FLASK_MONGO
+  ECSAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AvailabilityZones:
+        - Fn::Select:
+            - 0
+            - Fn::GetAZs:
+                Ref: AWS::Region
+      VPCZoneIdentifier:
+        - Ref: SubnetId1
+      LaunchConfigurationName:
+        Ref: ContainerInstances
+      MinSize: 2
+      MaxSize: 5
+      DesiredCapacity: 2
+      Tags:
+        - Key: Name
+          Value: ECS WORKER
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT15M
+        WaitOnResourceSignals: true
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
+# By using target tracking i have done it we can use simplescaling, stepscaling as well with it for cluster scaling.
+  ScalingPolicyCluster:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ECSAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      Cooldown: 120
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 10.0
+    DependsOn: ECSAutoScalingGroup
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId:
+        Ref: VPCID
+      GroupDescription: Enable SSH access via port 22
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCIDRIp
+        - IpProtocol: tcp
+          FromPort: 27017
+          ToPort: 27017
+          CidrIp: !Ref AllowedCIDRIp
+        - IpProtocol: tcp
+          FromPort: 5011
+          ToPort: 5011
+          CidrIp: !Ref AllowedCIDRIp
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedCIDRIp
+  ContainerInstances:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId:
+        Ref: ECSAMI
+      InstanceType:
+        Ref: InstanceType
+      IamInstanceProfile:
+        Ref: EC2InstanceProfile
+      KeyName:
+        Ref: KeyName
+      AssociatePublicIpAddress: true
+      SecurityGroups:
+        - Ref: InstanceSecurityGroup
+      UserData:
+        Fn::Base64:
+          Fn::Sub: "#!/bin/bash\nyum install -y aws-cfn-bootstrap\n/opt/aws/bin/cfn-init
+            -v --region ${AWS::Region} --stack ${AWS::StackName} --resource ContainerInstances\n/opt/aws/bin/cfn-signal
+            -e $? --region ${AWS::Region} --stack ${AWS::StackName} --resource ECSAutoScalingGroup\n\nexec
+            2>>/var/log/ecs/ecs-agent-install.log\nset -x\nuntil curl -s http://localhost:51678/v1/metadata\ndo\n
+            \  sleep 1\ndone\ndocker plugin install rexray/ebs REXRAY_PREEMPT=true
+            EBS_REGION=us-west-2 --grant-all-permissions\nstop ecs \nstart ecs\n"
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            yum:
+              aws-cli: []
+              jq: []
+              ecs-init: []
+          commands:
+            01_add_instance_to_cluster:
+              command:
+                Fn::Sub: echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+            02_start_ecs_agent:
+              command: start ecs
+          files:
+            "/etc/cfn/cfn-hup.conf":
+              mode: 256
+              owner: root
+              group: root
+              content:
+                Fn::Sub: |
+                  [main]
+                  stack=${AWS::StackId}
+                  region=${AWS::Region}
+            "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
+              content:
+                Fn::Sub: |
+                  [cfn-auto-reloader-hook]
+                  triggers=post.update
+                  path=Resources.ContainerInstances.Metadata.AWS::CloudFormation::Init
+                  action=/opt/aws/bin/cfn-init -v --region ${AWS::Region} --stack ${AWS::StackName} --resource ContainerInstances
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument: |
+        {
+          "Statement": [{
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ec2.amazonaws.com"
+              }
+          }]
+        }
+      Policies:
+        - PolicyName: ECSforEC2InstanceRolePolicy
+          PolicyDocument: |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ecs:CreateCluster",
+                    "ecs:DeregisterContainerInstance",
+                    "ecs:DiscoverPollEndpoint",
+                    "ecs:Poll",
+                    "ecs:RegisterContainerInstance",
+                    "ecs:StartTelemetrySession",
+                    "ecs:Submit*",
+                    "ecr:GetAuthorizationToken",
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:BatchGetImage",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+        - PolicyName: RexrayPolicy
+          PolicyDocument: |
+            {
+              "Version": "2012-10-17",
+              "Statement": [{
+                "Effect": "Allow",
+                "Action": [
+                  "ec2:AttachVolume",
+                  "ec2:CreateVolume",
+                  "ec2:CreateSnapshot",
+                  "ec2:CreateTags",
+                  "ec2:DeleteVolume",
+                  "ec2:DeleteSnapshot",
+                  "ec2:DescribeAvailabilityZones",
+                  "ec2:DescribeInstances",
+                  "ec2:DescribeVolumes",
+                  "ec2:DescribeVolumeAttribute",
+                  "ec2:DescribeVolumeStatus",
+                  "ec2:DescribeSnapshots",
+                  "ec2:CopySnapshot",
+                  "ec2:DescribeSnapshotAttribute",
+                  "ec2:DetachVolume",
+                  "ec2:ModifySnapshotAttribute",
+                  "ec2:ModifyVolumeAttribute",
+                  "ec2:DescribeTags"
+                ],
+                "Resource": "*"
+              }]
+            }
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - Ref: EC2Role
+
+  PrivateNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+        Name: salman
+        Vpc: !Ref VPCID
+  Taskdefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: mongo_family
+      Cpu: 512
+      Memory: 512
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - EC2
+      ContainerDefinitions:
+        - Name: mongo_task_definition
+          Image: 281668362239.dkr.ecr.us-east-1.amazonaws.com/falah-mongo-db:latest
+          Essential: true
+          MountPoints:
+            - SourceVolume: rexray-vol
+              ContainerPath: /data/db
+          PortMappings:
+            - ContainerPort: 27017
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-create-group: true
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+      Volumes:
+        - Name: rexray-vol
+          DockerVolumeConfiguration:
+            Autoprovision: true
+            Scope: shared
+            Driver: rexray/ebs
+            DriverOpts:
+              volumetype: gp2
+              size: 5
+  TaskdefinitionFlask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: flask_family
+      Cpu: 512
+      Memory: 512
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - EC2
+      ContainerDefinitions:
+        - Name: flask_task_definition
+          Image: 281668362239.dkr.ecr.us-east-1.amazonaws.com/flask_app:63
+          Essential: true
+          Environment: 
+            - Name: mongo
+              Value: mongo_service.salman
+          PortMappings:
+            - ContainerPort: 5011
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-create-group: true
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+  # InternetGateway:
+  #   Type: AWS::EC2::InternetGateway
+  # GatewayAttachment:
+  #   Type: AWS::EC2::VPCGatewayAttachment
+  #   Properties:
+  #     InternetGatewayId: !Ref InternetGateway
+  #     VpcId: vpc-0178ebb886c5aed8f
+  FlaskService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      ServiceName: flask
+      DesiredCount: 1
+      TaskDefinition: !Ref TaskdefinitionFlask
+      LaunchType: EC2
+      LoadBalancers:
+        - ContainerName: flask_task_definition
+          ContainerPort: 5011
+          TargetGroupArn: !Ref FlaskTargetgroup
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref InstanceSecurityGroup
+          Subnets:
+            - !Ref SubnetId1
+            - !Ref SubnetId2
+    DependsOn: LoadBalancerListener
+  DiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties: 
+      Description: Discovery Service for the Demo Application
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords:
+          - TTL: 60
+            Type: A
+          - TTL: 60
+            Type: SRV
+      Name: mongo_service
+      NamespaceId: !Ref PrivateNamespace
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      ServiceName: mongo
+      DesiredCount: 1
+      TaskDefinition: !Ref Taskdefinition
+      LaunchType: EC2
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref InstanceSecurityGroup
+          Subnets:
+            - !Ref SubnetId1
+      ServiceRegistries:
+        - RegistryArn: !GetAtt DiscoveryService.Arn
+          Port: 80
+    DependsOn: DiscoveryService
+  LogGroup: 
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: mongo_cloud_formation_log_group1
+  FlaskTargetgroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: 
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: '/'
+      HealthCheckPort: '5011'
+      HealthCheckProtocol: 'HTTP'
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      Name: flask-target
+      Port: 5011
+      Protocol: 'HTTP'
+      TargetType: 'ip'
+      UnhealthyThresholdCount: 5
+      VpcId: !Ref VPCID
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: lb-flask
+      Subnets: 
+        - !Ref SubnetId1
+        - !Ref SubnetId2
+      SecurityGroups:
+        - !Ref InstanceSecurityGroup
+    DependsOn: FlaskTargetgroup
+
+  LoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FlaskTargetgroup
+    DependsOn: LoadBalancer
+    DependsOn: FlaskTargetgroup
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: service-auto-scaling-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [application-autoscaling.amazonaws.com]
+            Action: ["sts:AssumeRole"]
+      Policies:
+        - PolicyName: service-auto-scaling-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:UpdateService
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:DeleteAlarms
+                Resource:
+                  - "*"
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      RoleARN: !GetAtt AutoScalingRole.Arn
+      ResourceId: !Join [ "/", [ service,!Ref ECSCluster, !GetAtt FlaskService.Name ] ]
+      #!Join [ "/", [ service,!Rwf ECSCluster, !GetAtt FlaskService.Name ] ]
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      MinCapacity: 1
+      MaxCapacity: 5
+    DependsOn: AutoScalingRole
+
+
+  ScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: my-service-auto-scaling-policy
+      ## Here I have used target type scaling
+      ## load testing `ab -c 1 -n 100000 -t 600 lb.dns`
+      ## we can use Step-scaling I did that with console and for that we have to create cloudwatch alarm
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 20.0
+    DependsOn: ScalableTarget
+
+Outputs:
+  LoadBalancer:
+    Description: Name of LoadBalancer
+    Value: !GetAtt LoadBalancer.LoadBalancerName
+  FlaskServiecName:
+    Description: Name of flask service in Cluster
+    Value: !GetAtt FlaskService.Name
+  ClusterName:
+    Description: Name of Cluster
+    Value: !Ref ECSCluster
+  LoadBalancerUrl:
+    Description: The URL of the ALB
+    Value: !GetAtt LoadBalancer.DNSName
